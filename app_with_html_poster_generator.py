@@ -3,9 +3,8 @@ import requests
 import io
 import base64
 import html
-import os
-import tempfile
-from playwright.sync_api import sync_playwright
+from PIL import Image
+import cairosvg
 
 
 GOLD_PRICE = 4600
@@ -261,264 +260,142 @@ def draw_text_box_center(draw, text, center_x, y, font, fill, max_width, max_lin
         yy += (bbox[3] - bbox[1]) + line_gap
 
 
-def generate_client_image(uploaded_image, poster_data):
-    W, H = 1080, 1350
 
+def make_transparent_product_png(uploaded_image):
+    """Готує фото виробу: прибирає майже білий фон і повертає PNG base64."""
     uploaded_image.seek(0)
-    image_bytes = uploaded_image.read()
-    image_b64 = base64.b64encode(image_bytes).decode("utf-8")
+    img = Image.open(uploaded_image).convert("RGBA")
+    img.thumbnail((900, 650), Image.Resampling.LANCZOS)
+
+    pixels = img.load()
+    w, h = img.size
+    for y in range(h):
+        for x in range(w):
+            r, g, b, a = pixels[x, y]
+            if r > 235 and g > 235 and b > 235:
+                pixels[x, y] = (r, g, b, 0)
+            elif r > 218 and g > 218 and b > 218:
+                alpha = max(0, 255 - (min(r, g, b) - 218) * 10)
+                pixels[x, y] = (r, g, b, min(a, alpha))
+
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    return base64.b64encode(buf.getvalue()).decode("utf-8"), img.width, img.height
+
+
+def svg_escape(value):
+    return html.escape(str(value), quote=True)
+
+
+def split_title(title):
+    title = title.replace("⚜️", "").strip().upper()
+    title = title.replace(" ОБРУЧОК ", " ОБРУЧОК\n")
+    title = title.replace(" КАБЛУЧКА ", " КАБЛУЧКА\n")
+    if "ВИШИВАНКА" in title and "\n" not in title:
+        title = title.replace(" «", "\n«")
+    return [line.strip() for line in title.split("\n") if line.strip()]
+
+
+def svg_center_text(lines, x, y, font_size, fill, weight="400", family="DejaVu Serif", line_height=1.2, letter_spacing=0):
+    out = []
+    if not isinstance(lines, list):
+        lines = [lines]
+    for i, line in enumerate(lines):
+        yy = y + i * font_size * line_height
+        out.append(
+            f'<text x="{x}" y="{yy}" text-anchor="middle" '
+            f'font-family="{family}" font-size="{font_size}" font-weight="{weight}" '
+            f'letter-spacing="{letter_spacing}" fill="{fill}">{svg_escape(line)}</text>'
+        )
+    return "\n".join(out)
+
+
+def generate_client_image(uploaded_image, poster_data):
+    """Генерує PNG через SVG + CairoSVG. Український текст малюється як SVG-текст."""
+    W, H = 1080, 1350
+    copper = "#e6a06a"
+    white = "#f5f0ea"
+    muted = "#9f9f9f"
+    line = "#c9824d"
+
+    image_b64, img_w, img_h = make_transparent_product_png(uploaded_image)
 
     title = poster_data.get("title", "Індивідуальна модель обручок").replace("⚜️", "").strip()
     gold = poster_data.get("gold", "Біле родоване золото 585 проби").replace("💍", "").strip()
     sizes = poster_data.get("sizes", "").replace("Розміри: ", "").replace("Розмір: ", "").strip()
     widths = poster_data.get("widths", "").replace("Ширина: ", "").strip()
     coating = poster_data.get("coating", "").replace("Покриття: ", "").strip()
-    weight = poster_data.get("weight", "").replace("Середня вага виробу: ", "").strip()
+    weight_text = poster_data.get("weight", "").replace("Середня вага виробу: ", "").strip()
     price = poster_data.get("price", "")
     inserts = poster_data.get("inserts", "").replace("Вставки: ", "").strip()
 
-    size_label = "РОЗМІРИ" if "та" in sizes else "РОЗМІР"
+    max_img_w, max_img_h = 820, 560
+    scale = min(max_img_w / img_w, max_img_h / img_h, 1)
+    draw_w = int(img_w * scale)
+    draw_h = int(img_h * scale)
+    img_x = (W - draw_w) // 2
+    img_y = 300 + (560 - draw_h) // 2
+
+    title_svg = svg_center_text(split_title(title), W / 2, 82, 58, copper, weight="500", line_height=1.12, letter_spacing=2)
+    subtitle_svg = svg_center_text(gold.upper(), W / 2, 230, 34, white, weight="400", letter_spacing=1.5)
 
     columns = [
-        ("ЗОЛОТО", "Біле родоване<br>585 проби"),
-        (size_label, sizes),
+        ("ЗОЛОТО", "Біле родоване\n585 проби"),
+        ("РОЗМІРИ" if "та" in sizes else "РОЗМІР", sizes),
         ("ШИРИНА", widths),
         ("ПОКРИТТЯ", coating),
-        ("ВАГА", weight),
+        ("ВАГА", weight_text),
     ]
-
     if inserts and inserts != "не додано":
         columns.append(("ВСТАВКИ", inserts))
 
-    columns_html = ""
-    for label, value in columns:
-        columns_html += f'''
-        <div class="spec-col">
-            <div class="spec-label">{html.escape(label)}</div>
-            <div class="spec-value">{value}</div>
-        </div>
-        '''
+    specs_y = 905
+    specs_h = 145
+    margin_x = 54
+    usable_w = W - margin_x * 2
+    col_w = usable_w / len(columns)
+    specs_svg = [f'<line x1="{margin_x}" y1="1058" x2="{W-margin_x}" y2="1058" stroke="{line}" stroke-width="2"/>']
 
-    safe_title = html.escape(title.upper()).replace("«", "&laquo;").replace("»", "&raquo;")
-    safe_gold = html.escape(gold.upper())
+    for i, (label, value) in enumerate(columns):
+        cx = margin_x + col_w * i + col_w / 2
+        if i > 0:
+            xline = margin_x + col_w * i
+            specs_svg.append(f'<line x1="{xline}" y1="{specs_y}" x2="{xline}" y2="{specs_y + specs_h - 20}" stroke="{line}" stroke-width="2"/>')
+        label_size = 24 if len(columns) == 6 else 28
+        value_size = 27 if len(columns) == 6 else 32
+        specs_svg.append(svg_center_text(label, cx, specs_y + 28, label_size, copper, weight="700", family="DejaVu Sans", letter_spacing=1.2))
+        value_lines = str(value).split("\n")
+        specs_svg.append(svg_center_text(value_lines, cx, specs_y + 82, value_size, white, weight="400", family="DejaVu Sans", line_height=1.15))
 
-    html_doc = f'''
-<!DOCTYPE html>
-<html lang="uk">
-<head>
-<meta charset="utf-8" />
-<style>
-    * {{ box-sizing: border-box; }}
-    html, body {{ margin: 0; padding: 0; background: #000; width: {W}px; height: {H}px; }}
-    body {{
-        font-family: Georgia, "Times New Roman", "DejaVu Serif", serif;
-        color: #f5f0ea;
-        overflow: hidden;
-    }}
-    .poster {{
-        width: {W}px;
-        height: {H}px;
-        background:
-            radial-gradient(circle at 50% 37%, rgba(220,160,90,0.14), transparent 34%),
-            linear-gradient(180deg, #030303 0%, #000 55%, #030303 100%);
-        position: relative;
-        overflow: hidden;
-    }}
-    .title {{
-        position: absolute;
-        top: 48px;
-        left: 70px;
-        right: 70px;
-        text-align: center;
-        color: #e69a60;
-        font-size: 62px;
-        line-height: 1.16;
-        letter-spacing: 3px;
-        text-transform: uppercase;
-        text-shadow: 0 2px 12px rgba(230,154,96,0.28);
-        font-weight: 500;
-    }}
-    .subtitle {{
-        position: absolute;
-        top: 210px;
-        left: 70px;
-        right: 70px;
-        text-align: center;
-        color: #f2f2f2;
-        font-size: 32px;
-        line-height: 1.2;
-        letter-spacing: 2px;
-        text-transform: uppercase;
-        text-shadow: 0 2px 10px rgba(255,255,255,0.25);
-    }}
-    .image-wrap {{
-        position: absolute;
-        left: 110px;
-        top: 285px;
-        width: 860px;
-        height: 560px;
-        display: flex;
-        align-items: center;
-        justify-content: center;
-    }}
-    #productCanvas {{
-        max-width: 860px;
-        max-height: 560px;
-        object-fit: contain;
-        filter: drop-shadow(0 30px 40px rgba(0,0,0,0.9));
-    }}
-    .specs {{
-        position: absolute;
-        top: 890px;
-        left: 56px;
-        right: 56px;
-        height: 145px;
-        display: grid;
-        grid-template-columns: repeat({len(columns)}, 1fr);
-        border-bottom: 2px solid #c9824d;
-        padding-bottom: 28px;
-    }}
-    .spec-col {{
-        text-align: center;
-        padding: 0 16px;
-        border-right: 2px solid #c9824d;
-        display: flex;
-        flex-direction: column;
-        align-items: center;
-        justify-content: flex-start;
-    }}
-    .spec-col:last-child {{ border-right: none; }}
-    .spec-label {{
-        color: #e69a60;
-        font-size: {24 if len(columns) == 6 else 28}px;
-        letter-spacing: 1.4px;
-        margin-bottom: 22px;
-        white-space: nowrap;
-        font-weight: 600;
-    }}
-    .spec-value {{
-        color: #f7f7f7;
-        font-size: {29 if len(columns) == 6 else 34}px;
-        line-height: 1.25;
-        text-shadow: 0 2px 8px rgba(255,255,255,0.18);
-        word-break: normal;
-    }}
-    .price-label {{
-        position: absolute;
-        top: 1095px;
-        left: 80px;
-        right: 80px;
-        color: #e69a60;
-        text-align: center;
-        font-size: 34px;
-        letter-spacing: 1.5px;
-        text-transform: uppercase;
-        font-weight: 700;
-    }}
-    .price {{
-        position: absolute;
-        top: 1160px;
-        left: 80px;
-        right: 80px;
-        color: #e69a60;
-        text-align: center;
-        font-size: 76px;
-        line-height: 1;
-        letter-spacing: 2px;
-        text-shadow: 0 2px 14px rgba(230,154,96,0.35);
-    }}
-    .brand {{
-        position: absolute;
-        bottom: 32px;
-        left: 0;
-        right: 0;
-        text-align: center;
-        color: #9b9b9b;
-        font-family: Arial, "DejaVu Sans", sans-serif;
-        font-size: 30px;
-        letter-spacing: 5px;
-        font-weight: 300;
-    }}
-</style>
-</head>
-<body>
-<div class="poster">
-    <div class="title">{safe_title}</div>
-    <div class="subtitle">{safe_gold}</div>
+    svg = f"""<?xml version=\"1.0\" encoding=\"UTF-8\"?>
+<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"{W}\" height=\"{H}\" viewBox=\"0 0 {W} {H}\">
+    <defs>
+        <radialGradient id=\"glow\" cx=\"50%\" cy=\"39%\" r=\"45%\">
+            <stop offset=\"0%\" stop-color=\"#3a2416\" stop-opacity=\"0.65\"/>
+            <stop offset=\"55%\" stop-color=\"#120b07\" stop-opacity=\"0.32\"/>
+            <stop offset=\"100%\" stop-color=\"#000000\" stop-opacity=\"0\"/>
+        </radialGradient>
+        <linearGradient id=\"bg\" x1=\"0\" y1=\"0\" x2=\"0\" y2=\"1\">
+            <stop offset=\"0%\" stop-color=\"#030303\"/>
+            <stop offset=\"52%\" stop-color=\"#000000\"/>
+            <stop offset=\"100%\" stop-color=\"#030303\"/>
+        </linearGradient>
+        <filter id=\"softShadow\" x=\"-30%\" y=\"-30%\" width=\"160%\" height=\"160%\">
+            <feDropShadow dx=\"0\" dy=\"28\" stdDeviation=\"24\" flood-color=\"#000000\" flood-opacity=\"0.9\"/>
+        </filter>
+    </defs>
+    <rect width=\"100%\" height=\"100%\" fill=\"url(#bg)\"/>
+    <rect width=\"100%\" height=\"100%\" fill=\"url(#glow)\"/>
+    {title_svg}
+    {subtitle_svg}
+    <image href=\"data:image/png;base64,{image_b64}\" x=\"{img_x}\" y=\"{img_y}\" width=\"{draw_w}\" height=\"{draw_h}\" preserveAspectRatio=\"xMidYMid meet\" filter=\"url(#softShadow)\"/>
+    {''.join(specs_svg)}
+    <text x=\"{W/2}\" y=\"1140\" text-anchor=\"middle\" font-family=\"DejaVu Sans\" font-size=\"38\" font-weight=\"700\" letter-spacing=\"1.5\" fill=\"{copper}\">СЕРЕДНЯ ВАРТІСТЬ ВИРОБУ:</text>
+    <text x=\"{W/2}\" y=\"1230\" text-anchor=\"middle\" font-family=\"DejaVu Serif\" font-size=\"82\" font-weight=\"500\" letter-spacing=\"2\" fill=\"{copper}\">{svg_escape(price)} грн</text>
+    <text x=\"{W/2}\" y=\"1308\" text-anchor=\"middle\" font-family=\"DejaVu Sans\" font-size=\"32\" font-weight=\"300\" letter-spacing=\"5\" fill=\"{muted}\">LANA &amp; LONA</text>
+</svg>"""
 
-    <div class="image-wrap">
-        <canvas id="productCanvas"></canvas>
-    </div>
-
-    <div class="specs">
-        {columns_html}
-    </div>
-
-    <div class="price-label">СЕРЕДНЯ ВАРТІСТЬ ВИРОБУ:</div>
-    <div class="price">{html.escape(price)} грн 💎</div>
-    <div class="brand">LANA &amp; LONA</div>
-</div>
-
-<script>
-const src = "data:image/png;base64,{image_b64}";
-const img = new Image();
-img.onload = () => {{
-    const maxW = 860;
-    const maxH = 560;
-    let w = img.width;
-    let h = img.height;
-    const scale = Math.min(maxW / w, maxH / h, 1);
-    w = Math.round(w * scale);
-    h = Math.round(h * scale);
-
-    const canvas = document.getElementById("productCanvas");
-    canvas.width = w;
-    canvas.height = h;
-    const ctx = canvas.getContext("2d");
-    ctx.drawImage(img, 0, 0, w, h);
-
-    const imageData = ctx.getImageData(0, 0, w, h);
-    const d = imageData.data;
-    for (let i = 0; i < d.length; i += 4) {{
-        const r = d[i], g = d[i + 1], b = d[i + 2];
-        if (r > 238 && g > 238 && b > 238) {{
-            d[i + 3] = 0;
-        }} else if (r > 218 && g > 218 && b > 218) {{
-            const alpha = Math.max(0, 255 - (Math.min(r,g,b) - 218) * 9);
-            d[i + 3] = Math.min(d[i + 3], alpha);
-        }}
-    }}
-    ctx.putImageData(imageData, 0, 0);
-}};
-img.src = src;
-</script>
-</body>
-</html>
-'''
-
-    with tempfile.NamedTemporaryFile("w", suffix=".html", delete=False, encoding="utf-8") as f:
-        f.write(html_doc)
-        html_path = f.name
-
-    try:
-        with sync_playwright() as p:
-            chromium_path = "/usr/bin/chromium"
-            launch_kwargs = {"headless": True, "args": ["--no-sandbox", "--disable-dev-shm-usage"]}
-            if os.path.exists(chromium_path):
-                launch_kwargs["executable_path"] = chromium_path
-
-            browser = p.chromium.launch(**launch_kwargs)
-            page = browser.new_page(viewport={"width": W, "height": H}, device_scale_factor=1)
-            page.goto("file://" + html_path, wait_until="networkidle")
-            page.wait_for_timeout(700)
-            png_bytes = page.locator(".poster").screenshot(type="png")
-            browser.close()
-    finally:
-        try:
-            os.remove(html_path)
-        except Exception:
-            pass
-
+    png_bytes = cairosvg.svg2png(bytestring=svg.encode("utf-8"), output_width=W, output_height=H)
     return io.BytesIO(png_bytes)
 
 
